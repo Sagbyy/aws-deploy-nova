@@ -111,6 +111,27 @@ Cette stratégie nous protège des régressions en production, si la nouvelle ve
 
 ![image.png](images/image%203.png)
 
+### RDS
+
+- Secret stocke dans AWS Secrets Manager
+- Les taches ECS sur Fargate utilisent les parametres RDS (`DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USER`, `DB_PASSWORD`) pour etablir la connexion PostgreSQL entre l'API et l'instance `nova-db`.
+- Exemple de connexion PostgreSQL avec recuperation du mot de passe via secret:
+
+```bash
+psql "host=$RDSHOST port=5432 dbname=postgres user=postgres sslmode=verify-full sslrootcert=./global-bundle.pem password=$(aws secretsmanager get-secret-value --secret-id 'arn:aws:secretsmanager:eu-west-1:682405976856:secret:rds!db-f5009b56-3220-4afa-a5f8-62146034ed37-dQqhJn' --query SecretString --output text | jq -r '.password')"
+```
+
+### Sauvegardes automatiques RDS
+
+- Sauvegarde automatique quotidienne
+- Retention des sauvegardes: 1 semaine
+- Possibilite de restauration a un instant precis (point-in-time recovery) sur la periode de retention
+
+### Chiffrement RDS
+
+- Chiffrement active
+- Cle KMS: `aws/rds`
+  
 #### Réseau
 
 Le service est déployé en mode **`awsvpc`**, ce qui attribue une interface réseau dédiée à chaque tâche Fargate. Il est réparti sur **3 sous-réseaux** de la VPC en `eu-west-1` pour garantir la disponibilité multi-AZ, et exposé via un **Application Load Balancer** avec deux target groups actifs qui permettent les déploiements Canary sans interruption de service.
@@ -453,7 +474,7 @@ docker tag nova-core:private-s3 <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nov
 docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
 ```
 
-## 6) Deploiement ECS
+## 6) Re déploiement ECS
 
 1. Creer une nouvelle revision de Task Definition
 2. Mettre a jour:
@@ -464,30 +485,7 @@ docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
 3. Mettre a jour le service ECS
 4. Forcer un nouveau deploiement
 
-## 7) Deploiement RDS
-
-### RDS
-
-- Secret stocke dans AWS Secrets Manager
-- Les taches ECS sur Fargate utilisent les parametres RDS (`DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USER`, `DB_PASSWORD`) pour etablir la connexion PostgreSQL entre l'API et l'instance `nova-db`.
-- Exemple de connexion PostgreSQL avec recuperation du mot de passe via secret:
-
-```bash
-psql "host=$RDSHOST port=5432 dbname=postgres user=postgres sslmode=verify-full sslrootcert=./global-bundle.pem password=$(aws secretsmanager get-secret-value --secret-id 'arn:aws:secretsmanager:eu-west-1:682405976856:secret:rds!db-f5009b56-3220-4afa-a5f8-62146034ed37-dQqhJn' --query SecretString --output text | jq -r '.password')"
-```
-
-### Sauvegardes automatiques RDS
-
-- Sauvegarde automatique quotidienne
-- Retention des sauvegardes: 1 semaine
-- Possibilite de restauration a un instant precis (point-in-time recovery) sur la periode de retention
-
-### Chiffrement RDS
-
-- Chiffrement active
-- Cle KMS: `aws/rds`
-
-## 8) Deploiement Lambda resizer
+## 7) Deploiement Lambda resizer
 
 1. Deployer le code lambda
 2. Verifier les triggers S3 (`uploads/`, `s3:ObjectCreated:Put`) avec les extensions filtrees:
@@ -504,7 +502,7 @@ psql "host=$RDSHOST port=5432 dbname=postgres user=postgres sslmode=verify-full 
 - En cas d'erreur (au moins 1 sur une periode de 5 minutes), une notification email est envoyee via SNS.
 - Objectif: etre alerte immediatement en cas de dysfonctionnement de la lambda.
 
-## 9) Verification post-deploiement
+## 8) Verification post-deploiement
 
 1. Upload via endpoint API
 2. Verification objet source dans `uploads/`
@@ -513,7 +511,7 @@ psql "host=$RDSHOST port=5432 dbname=postgres user=postgres sslmode=verify-full 
 5. Verification acces direct non signe -> `403 AccessDenied`
 6. Verification expiration (~15 min) puis refetch API
 
-## 10) Dépannage des erreurs recontrées
+## 9) Dépannage des erreurs recontrées
 
 - `AccessDenied` upload:
   - verifier policy sur `ecsTaskRole`
