@@ -531,7 +531,7 @@ docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
 
 ---
 
-# Déploiement Frontend (Next.js) sur AWS Amplify
+# Partie 3. Déploiement Frontend (Next.js) sur AWS Amplify
 
 ## 1. Flux global frontend
 
