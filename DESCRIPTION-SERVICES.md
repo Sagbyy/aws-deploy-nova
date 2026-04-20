@@ -318,3 +318,63 @@ Toutes les règles sont actuellement en mode **`Count`** (observation) plutôt q
 
 L'action par défaut du WAF est **`Allow`** tout ce qui ne correspond à aucune règle passe librement.
 
+---
+### S3 Storage
+Stockage objet privé des médias applicatifs.
+
+- Rôle : réception des images uploadées (uploads/...) et lecture des images optimisées (resized/...) via URL présignées.
+
+
+- Justification : service managé, durable, scalable, coût maîtrisé, adapté au flux upload + traitement asynchrone Lambda.
+
+
+- Intégration backend (ECS Node.js)
+
+Variables utilisées :
+DRIVE_DISK=s3
+AWS_REGION=eu-west-1
+S3_BUCKET=cloud-nova-images
+PORT=8080, HOST=0.0.0.0
+
+
+En production AWS: pas de AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_ENDPOINT (auth via Task Role IAM).
+
+
+Librairies utilisées :
+@adonisjs/drive (abstraction stockage)
+flydrive (driver S3 sous-jacent)
+@aws-sdk/client-s3 / presign via Flydrive 
+---
+### Lambda
+Traitement automatique des images à l’upload.
+
+- Rôle : déclenchée par événement S3 ObjectCreated sur préfixe uploads/, lit l’original, redimensionne/comprime, écrit en resized/.
+
+
+- Justification : traitement asynchrone serverless, simple à opérer, coût à l’usage, découplé du backend API.
+
+
+- Intégration : S3 déclenche Lambda; Lambda utilise son rôle IAM pour GetObject sur uploads/* et PutObject sur resized/*; le backend consomme ensuite les fichiers resized/.
+---
+### Amplify
+Hébergement et déploiement continu du frontend (Next.js), avec build automatique depuis le dépôt Git.
+
+- Rôle : publier l’interface web, gérer les environnements (preview/prod) et exposer le domaine frontend.
+
+
+- Justification : mise en production simple, CI/CD intégré, gestion native du hosting frontend AWS.
+
+
+- Intégration : le frontend déployé sur Amplify appelle l’API backend via CloudFront/ALB et affiche les URLs présignées retournées par l’API pour les images.
+
+#### Pourquoi Amplify et pas S3 statique ?
+
+Amplify est le bon choix ici car ce frontend n'est pas un simple site statique:
+
+- Projet Next.js App Router avec logique serveur (ex: route NextAuth `/api/auth/[...nextauth]`).
+- Authentification NextAuth nécessite un runtime serveur pour gérer sessions/cookies/callbacks.
+- CI/CD Git intégré (build à chaque push), previews de branches, domaine/SSL simplifiés.
+- Support natif du déploiement Next.js moderne sans refactor majeur.
+
+S3 statique conviendrait seulement pour un site 100% exportable (`next export`) sans runtime serveur.
+Dans l'état actuel du code, passer en S3 statique demanderait une refonte de l'auth et des routes serveur.
