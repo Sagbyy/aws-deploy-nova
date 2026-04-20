@@ -18,6 +18,7 @@ Les projets sont disponible dans ces repos ci dessous :
 - Repository ECR: `<ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core`
 - Service ECS Fargate derriere ALB
 - Role IAM ECS Task Role: `ecsTaskRole`
+- RDS Postgres: `nova-db`
 - Lambda resizer + role d'execution: `nova-image-resizer-role-...`
 - AWS CLI + Docker Desktop
 
@@ -118,6 +119,36 @@ Policy de compartiment:
 }
 ```
 
+### Chiffrement S3
+
+- Chiffrement active
+- SSE-S3 (cles gerees par Amazon S3)
+
+### Regle de cycle de vie (purge automatique `uploads/`)
+
+- Une regle de cycle de vie S3 est en place pour supprimer automatiquement les fichiers du dossier `uploads/` apres 1 jour.
+- Configuration appliquee:
+  - Nom de la regle: `purge-uploads-1j`
+  - Portee: prefixe `uploads/`
+  - Action: expiration des objets apres 1 jour
+
+Exemple JSON:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "purge-uploads-1j",
+      "Prefix": "uploads/",
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    }
+  ]
+}
+```
+
 ## 5) Build et push image ECR
 
 ```bash
@@ -138,14 +169,47 @@ docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
 3. Mettre a jour le service ECS
 4. Forcer un nouveau deploiement
 
-## 7) Deploiement Lambda resizer
+## 7) Deploiement RDS
+
+### RDS
+
+- Secret stocke dans AWS Secrets Manager
+- Les taches ECS sur Fargate utilisent les parametres RDS (`DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USER`, `DB_PASSWORD`) pour etablir la connexion PostgreSQL entre l'API et l'instance `nova-db`.
+- Exemple de connexion PostgreSQL avec recuperation du mot de passe via secret:
+
+```bash
+psql "host=$RDSHOST port=5432 dbname=postgres user=postgres sslmode=verify-full sslrootcert=./global-bundle.pem password=$(aws secretsmanager get-secret-value --secret-id 'arn:aws:secretsmanager:eu-west-1:682405976856:secret:rds!db-f5009b56-3220-4afa-a5f8-62146034ed37-dQqhJn' --query SecretString --output text | jq -r '.password')"
+```
+
+### Sauvegardes automatiques RDS
+
+- Sauvegarde automatique quotidienne
+- Retention des sauvegardes: 1 semaine
+- Possibilite de restauration a un instant precis (point-in-time recovery) sur la periode de retention
+
+### Chiffrement RDS
+
+- Chiffrement active
+- Cle KMS: `aws/rds`
+
+## 8) Deploiement Lambda resizer
 
 1. Deployer le code lambda
-2. Verifier le trigger S3 (`uploads/`, `s3:ObjectCreated:Put`)
+2. Verifier les triggers S3 (`uploads/`, `s3:ObjectCreated:Put`) avec les extensions filtrees:
+   - `uploads/` + `.jpeg` -> `nova-image-resizer`
+   - `uploads/` + `.jpg` -> `nova-image-resizer`
+   - `uploads/` + `.png` -> `nova-image-resizer`
 3. Verifier les permissions du role d'execution (lecture `uploads/*`, ecriture `resized/*`)
 4. Verifier la permission resource-based `lambda:InvokeFunction` pour S3
+5. Verifier que la lambda applique bien un resize en `400x400`
 
-## 8) Flow image cible (upload -> resize -> read)
+### Alarme CloudWatch sur erreurs Lambda
+
+- Une alarme CloudWatch est configuree sur la metrique `Errors` de la fonction Lambda.
+- En cas d'erreur (au moins 1 sur une periode de 5 minutes), une notification email est envoyee via SNS.
+- Objectif: etre alerte immediatement en cas de dysfonctionnement de la lambda.
+
+## 9) Flow image cible (upload -> resize -> read)
 
 1. Le backend ecrit en prive sous `uploads/`, ex: `uploads/post-<uuid>.png`
 2. S3 declenche la lambda resizer
@@ -155,7 +219,7 @@ docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
    - fallback `uploads/...` si resized indisponible
 5. Le frontend lit toujours `image`/`avatar` avec URL presignee (TTL 15 min)
 
-## 9) Verification post-deploiement
+## 10) Verification post-deploiement
 
 1. Upload via endpoint API
 2. Verification objet source dans `uploads/`
@@ -164,7 +228,7 @@ docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
 5. Verification acces direct non signe -> `403 AccessDenied`
 6. Verification expiration (~15 min) puis refetch API
 
-## 10) Depannage rapide
+## 11) Depannage rapide
 
 - `AccessDenied` upload:
   - verifier policy sur `ecsTaskRole`
