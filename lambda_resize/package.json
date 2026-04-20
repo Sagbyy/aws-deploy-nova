@@ -1,0 +1,19 @@
+{
+  "name": "nova-image-resizer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/handler.js",
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.750.0",
+    "jimp": "^0.22.12"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.150",
+    "@types/node": "^25.6.0",
+    "typescript": "^5.8.0"
+  }
+}
