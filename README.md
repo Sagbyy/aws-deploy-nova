@@ -1,7 +1,4 @@
 ![img.png](images/archi.png)
-# Deploy Private Presigned Images to S3 (ECS + Lambda)
-
-Cette partie decrit les etapes pour deployer le backend avec images privees sur S3 et URLs presignees.
 
 Les projets sont disponible dans ces repos ci dessous : 
 
@@ -10,245 +7,7 @@ Les projets sont disponible dans ces repos ci dessous :
 
 ---
 
-## Partie 1 - Runbook de deploiement prive S3
-
-## 1) Prerequis
-
-- Bucket S3: `cloud-nova-images`
-- Repository ECR: `<ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core`
-- Service ECS Fargate derriere ALB
-- Role IAM ECS Task Role: `ecsTaskRole`
-- RDS Postgres: `nova-db`
-- Lambda resizer + role d'execution: `nova-image-resizer-role-...`
-- AWS CLI + Docker Desktop
-
-## 2) Variables d'environnement
-
-### ECS (Task Definition)
-
-- `DRIVE_DISK=s3`
-- `AWS_REGION=eu-west-1`
-- `S3_BUCKET=cloud-nova-images`
-- `PORT=8080`
-- `HOST=0.0.0.0`
-
-Non definies en prod ECS:
-
-- `AWS_ACCESS_KEY_ID`
-- `AWS_SECRET_ACCESS_KEY`
-- `S3_ENDPOINT`
-
-### Lambda resizer
-
-La lambda fournie (`S3Client({})`) utilise le role IAM et n'impose pas de variable obligatoire.
-
-## 3) IAM - recapitulatif permissions
-
-### ECS Task Role (`ecsTaskRole`)
-
-- `s3:ListBucket` sur `cloud-nova-images`
-- `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` sur `cloud-nova-images/uploads/*`
-- `s3:GetObject` sur `cloud-nova-images/resized/*`
-
-### Lambda execution role (`nova-image-resizer-role-...`)
-
-- `s3:GetObject` sur `cloud-nova-images/uploads/*`
-- `s3:PutObject` sur `cloud-nova-images/resized/*`
-- CloudWatch Logs (policy AWSLambdaBasicExecutionRole)
-
-### Lambda resource-based policy
-
-- Principal `s3.amazonaws.com`
-- Action `lambda:InvokeFunction`
-- SourceArn `arn:aws:s3:::cloud-nova-images`
-- SourceAccount `<ACCOUNT.ID>`
-
-## 4) Bucket S3
-
-- Bucket: `cloud-nova-images`
-- Block Public Access: ON
-- Aucune policy publique
-- Notification d'evenement vers lambda:
-  - Event: `s3:ObjectCreated:Put`
-  - Prefix: `uploads/`
-  - Target: `nova-image-resizer`
-
-Policy de compartiment:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "ReadOriginals",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/service-role/nova-image-resizer-role-i6qn8cmd"
-      },
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::cloud-nova-images/uploads/*"
-    },
-    {
-      "Sid": "WriteResized",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/service-role/nova-image-resizer-role-i6qn8cmd"
-      },
-      "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::cloud-nova-images/resized/*"
-    },
-    {
-      "Sid": "EcsUploadsWriteReadDelete",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/ecsTaskRole"
-      },
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::cloud-nova-images/uploads/*"
-    },
-    {
-      "Sid": "EcsReadResized",
-      "Effect": "Allow",
-      "Principal": {
-        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/ecsTaskRole"
-      },
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::cloud-nova-images/resized/*"
-    }
-  ]
-}
-```
-
-### Chiffrement S3
-
-- Chiffrement active
-- SSE-S3 (cles gerees par Amazon S3)
-
-### Regle de cycle de vie (purge automatique `uploads/`)
-
-- Une regle de cycle de vie S3 est en place pour supprimer automatiquement les fichiers du dossier `uploads/` apres 1 jour.
-- Configuration appliquee:
-  - Nom de la regle: `purge-uploads-1j`
-  - Portee: prefixe `uploads/`
-  - Action: expiration des objets apres 1 jour
-
-Exemple JSON:
-
-```json
-{
-  "Rules": [
-    {
-      "ID": "purge-uploads-1j",
-      "Prefix": "uploads/",
-      "Status": "Enabled",
-      "Expiration": {
-        "Days": 1
-      }
-    }
-  ]
-}
-```
-
-## 5) Build et push image ECR
-
-```bash
-aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com
-docker build --pull --no-cache -t nova-core:private-s3 .
-docker tag nova-core:private-s3 <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
-docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
-```
-
-## 6) Deploiement ECS
-
-1. Creer une nouvelle revision de Task Definition
-2. Mettre a jour:
-   - image `.../nova/core:private-s3-v5`
-   - port conteneur `8080/TCP`
-   - variables d'environnement
-   - `taskRoleArn=ecsTaskRole`
-3. Mettre a jour le service ECS
-4. Forcer un nouveau deploiement
-
-## 7) Deploiement RDS
-
-### RDS
-
-- Secret stocke dans AWS Secrets Manager
-- Les taches ECS sur Fargate utilisent les parametres RDS (`DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USER`, `DB_PASSWORD`) pour etablir la connexion PostgreSQL entre l'API et l'instance `nova-db`.
-- Exemple de connexion PostgreSQL avec recuperation du mot de passe via secret:
-
-```bash
-psql "host=$RDSHOST port=5432 dbname=postgres user=postgres sslmode=verify-full sslrootcert=./global-bundle.pem password=$(aws secretsmanager get-secret-value --secret-id 'arn:aws:secretsmanager:eu-west-1:682405976856:secret:rds!db-f5009b56-3220-4afa-a5f8-62146034ed37-dQqhJn' --query SecretString --output text | jq -r '.password')"
-```
-
-### Sauvegardes automatiques RDS
-
-- Sauvegarde automatique quotidienne
-- Retention des sauvegardes: 1 semaine
-- Possibilite de restauration a un instant precis (point-in-time recovery) sur la periode de retention
-
-### Chiffrement RDS
-
-- Chiffrement active
-- Cle KMS: `aws/rds`
-
-## 8) Deploiement Lambda resizer
-
-1. Deployer le code lambda
-2. Verifier les triggers S3 (`uploads/`, `s3:ObjectCreated:Put`) avec les extensions filtrees:
-   - `uploads/` + `.jpeg` -> `nova-image-resizer`
-   - `uploads/` + `.jpg` -> `nova-image-resizer`
-   - `uploads/` + `.png` -> `nova-image-resizer`
-3. Verifier les permissions du role d'execution (lecture `uploads/*`, ecriture `resized/*`)
-4. Verifier la permission resource-based `lambda:InvokeFunction` pour S3
-5. Verifier que la lambda applique bien un resize en `400x400`
-
-### Alarme CloudWatch sur erreurs Lambda
-
-- Une alarme CloudWatch est configuree sur la metrique `Errors` de la fonction Lambda.
-- En cas d'erreur (au moins 1 sur une periode de 5 minutes), une notification email est envoyee via SNS.
-- Objectif: etre alerte immediatement en cas de dysfonctionnement de la lambda.
-
-## 9) Flow image cible (upload -> resize -> read)
-
-1. Le backend ecrit en prive sous `uploads/`, ex: `uploads/post-<uuid>.png`
-2. S3 declenche la lambda resizer
-3. La lambda ecrit en prive sous `resized/`, ex: `resized/post-<uuid>.jpg`
-4. Au GET API:
-   - lecture prioritaire `resized/...`
-   - fallback `uploads/...` si resized indisponible
-5. Le frontend lit toujours `image`/`avatar` avec URL presignee (TTL 15 min)
-
-## 10) Verification post-deploiement
-
-1. Upload via endpoint API
-2. Verification objet source dans `uploads/`
-3. Verification objet transforme dans `resized/`
-4. Verification URL presignee (`X-Amz-Signature`, `X-Amz-Expires=900`)
-5. Verification acces direct non signe -> `403 AccessDenied`
-6. Verification expiration (~15 min) puis refetch API
-
-## 11) Depannage rapide
-
-- `AccessDenied` upload:
-  - verifier policy sur `ecsTaskRole`
-  - verifier `S3_BUCKET`, `AWS_REGION`
-  - verifier revision ECS active
-
-- `AccessDenied` lambda:
-  - verifier role `nova-image-resizer-role-...` (Get uploads / Put resized)
-  - verifier policy bucket et trigger S3
-
-- Pas de fichier dans `resized/`:
-  - verifier trigger prefix `uploads/`
-  - verifier logs CloudWatch `/aws/lambda/nova-image-resizer`
-
-- Meme digest ECR sur plusieurs tags:
-  - rebuild avec `--pull --no-cache`
-
----
-
-## Partie 2 - Projet (architecture AWS)
+# Partie 1 - Projet (architecture AWS)
 
 ### ECR
 
@@ -533,3 +292,312 @@ Un **Web ACL WAF v2** (`CreatedByALB-f608951e-302c-4397-951e-899ba0961d93`) est 
 Toutes les règles sont actuellement en mode **`Count`** (observation) plutôt qu'en mode `Block`. Cela signifie que les requêtes correspondantes sont comptabilisées et loggées dans CloudWatch, mais non bloquées. Ce mode permet de valider que les règles ne génèrent pas de faux positifs sur notre trafic légitime avant de basculer en mode bloquant.
 
 L'action par défaut du WAF est **`Allow`** tout ce qui ne correspond à aucune règle passe librement.
+
+---
+# Partie 2 - Deploy Private Presigned Images to S3 (ECS + Lambda)
+
+Cette partie decrit les etapes pour deployer le backend ECS qui upload/read les images privées sur S3 avec les URLs présignées.
+Flow image cible (upload -> resize -> read)
+
+1. Le backend ecrit en prive sous `uploads/`, ex: `uploads/post-<uuid>.png`
+2. S3 declenche la lambda resizer
+3. La lambda ecrit en prive sous `resized/`, ex: `resized/post-<uuid>.jpg`
+4. Au GET API:
+   - lecture prioritaire `resized/...`
+   - fallback `uploads/...` si resized indisponible
+5. Le frontend lit toujours `image`/`avatar` avec URL presignee (TTL 15 min)
+
+## 1) Prerequis
+
+- Bucket S3: `cloud-nova-images`
+- Repository ECR: `<ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core`
+- Service ECS Fargate derriere ALB
+- Role IAM ECS Task Role: `ecsTaskRole`
+- RDS Postgres: `nova-db`
+- Lambda resizer + role d'execution: `nova-image-resizer-role-...`
+- AWS CLI + Docker Desktop
+
+## 2) Variables d'environnement
+
+### ECS (Task Definition)
+
+- `DRIVE_DISK=s3`
+- `AWS_REGION=eu-west-1`
+- `S3_BUCKET=cloud-nova-images`
+- `PORT=8080`
+- `HOST=0.0.0.0`
+
+Non definies en prod ECS:
+
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `S3_ENDPOINT`
+
+### Lambda resizer
+
+La lambda fournie (`S3Client({})`) utilise le role IAM et n'impose pas de variable obligatoire.
+
+## 3) IAM - recapitulatif permissions
+
+### ECS Task Role (`ecsTaskRole`)
+
+- `s3:ListBucket` sur `cloud-nova-images`
+- `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` sur `cloud-nova-images/uploads/*`
+- `s3:GetObject` sur `cloud-nova-images/resized/*`
+
+### Lambda execution role (`nova-image-resizer-role-...`)
+
+- `s3:GetObject` sur `cloud-nova-images/uploads/*`
+- `s3:PutObject` sur `cloud-nova-images/resized/*`
+- CloudWatch Logs (policy AWSLambdaBasicExecutionRole)
+
+### Lambda resource-based policy
+
+- Principal `s3.amazonaws.com`
+- Action `lambda:InvokeFunction`
+- SourceArn `arn:aws:s3:::cloud-nova-images`
+- SourceAccount `<ACCOUNT.ID>`
+
+## 4) Bucket S3
+
+- Bucket: `cloud-nova-images`
+- Block Public Access: ON
+- Aucune policy publique
+- Notification d'evenement vers lambda:
+  - Event: `s3:ObjectCreated:Put`
+  - Prefix: `uploads/`
+  - Target: `nova-image-resizer`
+
+Policy de compartiment:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOriginals",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/service-role/nova-image-resizer-role-i6qn8cmd"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::cloud-nova-images/uploads/*"
+    },
+    {
+      "Sid": "WriteResized",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/service-role/nova-image-resizer-role-i6qn8cmd"
+      },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::cloud-nova-images/resized/*"
+    },
+    {
+      "Sid": "EcsUploadsWriteReadDelete",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/ecsTaskRole"
+      },
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::cloud-nova-images/uploads/*"
+    },
+    {
+      "Sid": "EcsReadResized",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<ACCOUNT.ID>:role/ecsTaskRole"
+      },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::cloud-nova-images/resized/*"
+    }
+  ]
+}
+```
+
+### Chiffrement S3
+
+- Chiffrement active
+- SSE-S3 (cles gerees par Amazon S3)
+
+### Regle de cycle de vie (purge automatique `uploads/`)
+
+- Une regle de cycle de vie S3 est en place pour supprimer automatiquement les fichiers du dossier `uploads/` apres 1 jour.
+- Configuration appliquee:
+  - Nom de la regle: `purge-uploads-1j`
+  - Portee: prefixe `uploads/`
+  - Action: expiration des objets apres 1 jour
+
+Exemple JSON:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "purge-uploads-1j",
+      "Prefix": "uploads/",
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 1
+      }
+    }
+  ]
+}
+```
+
+## 5) Build et push image ECR
+
+```bash
+aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com
+docker build --pull --no-cache -t nova-core:private-s3 .
+docker tag nova-core:private-s3 <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
+docker push <ACCOUNT.ID>.dkr.ecr.eu-west-1.amazonaws.com/nova/core:private-s3-v5
+```
+
+## 6) Deploiement ECS
+
+1. Creer une nouvelle revision de Task Definition
+2. Mettre a jour:
+   - image `.../nova/core:private-s3-v5`
+   - port conteneur `8080/TCP`
+   - variables d'environnement
+   - `taskRoleArn=ecsTaskRole`
+3. Mettre a jour le service ECS
+4. Forcer un nouveau deploiement
+
+## 7) Deploiement RDS
+
+### RDS
+
+- Secret stocke dans AWS Secrets Manager
+- Les taches ECS sur Fargate utilisent les parametres RDS (`DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USER`, `DB_PASSWORD`) pour etablir la connexion PostgreSQL entre l'API et l'instance `nova-db`.
+- Exemple de connexion PostgreSQL avec recuperation du mot de passe via secret:
+
+```bash
+psql "host=$RDSHOST port=5432 dbname=postgres user=postgres sslmode=verify-full sslrootcert=./global-bundle.pem password=$(aws secretsmanager get-secret-value --secret-id 'arn:aws:secretsmanager:eu-west-1:682405976856:secret:rds!db-f5009b56-3220-4afa-a5f8-62146034ed37-dQqhJn' --query SecretString --output text | jq -r '.password')"
+```
+
+### Sauvegardes automatiques RDS
+
+- Sauvegarde automatique quotidienne
+- Retention des sauvegardes: 1 semaine
+- Possibilite de restauration a un instant precis (point-in-time recovery) sur la periode de retention
+
+### Chiffrement RDS
+
+- Chiffrement active
+- Cle KMS: `aws/rds`
+
+## 8) Deploiement Lambda resizer
+
+1. Deployer le code lambda
+2. Verifier les triggers S3 (`uploads/`, `s3:ObjectCreated:Put`) avec les extensions filtrees:
+   - `uploads/` + `.jpeg` -> `nova-image-resizer`
+   - `uploads/` + `.jpg` -> `nova-image-resizer`
+   - `uploads/` + `.png` -> `nova-image-resizer`
+3. Verifier les permissions du role d'execution (lecture `uploads/*`, ecriture `resized/*`)
+4. Verifier la permission resource-based `lambda:InvokeFunction` pour S3
+5. Verifier que la lambda applique bien un resize en `400x400`
+
+### Alarme CloudWatch sur erreurs Lambda
+
+- Une alarme CloudWatch est configuree sur la metrique `Errors` de la fonction Lambda.
+- En cas d'erreur (au moins 1 sur une periode de 5 minutes), une notification email est envoyee via SNS.
+- Objectif: etre alerte immediatement en cas de dysfonctionnement de la lambda.
+
+## 9) Verification post-deploiement
+
+1. Upload via endpoint API
+2. Verification objet source dans `uploads/`
+3. Verification objet transforme dans `resized/`
+4. Verification URL presignee (`X-Amz-Signature`, `X-Amz-Expires=900`)
+5. Verification acces direct non signe -> `403 AccessDenied`
+6. Verification expiration (~15 min) puis refetch API
+
+## 10) Dépannage des erreurs recontrées
+
+- `AccessDenied` upload:
+  - verifier policy sur `ecsTaskRole`
+  - verifier `S3_BUCKET`, `AWS_REGION`
+  - verifier revision ECS active
+
+- `AccessDenied` lambda:
+  - verifier role `nova-image-resizer-role-...` (Get uploads / Put resized)
+  - verifier policy bucket et trigger S3
+
+- Pas de fichier dans `resized/`:
+  - verifier trigger prefix `uploads/`
+  - verifier logs CloudWatch `/aws/lambda/nova-image-resizer`
+
+- Meme digest ECR sur plusieurs tags:
+  - rebuild avec `--pull --no-cache`
+
+---
+
+# Déploiement Frontend (Next.js) sur AWS Amplify
+
+## 1. Flux global frontend
+
+1. L'utilisateur ouvre `https://main.dk9lkc5yg76k.amplifyapp.com/`.
+2. Le DNS résout le domaine frontend vers Amplify Hosting (distribution CloudFront).
+3. Amplify sert le frontend Next.js (pages, assets, rendu SSR si nécessaire).
+4. Le frontend appelle l'API backend via `https://co-64d04bd0e3a543c9a00182d31e71a818.ecs.eu-west-1.on.aws`.
+5. Le domaine du back end pointe vers l'ALB, puis l'ALB distribue vers ECS/Fargate.
+
+Résumé trafic:
+- Frontend: Utilisateur -> CloudFront/Amplify
+- API: Frontend (navigateur) -> ALB -> ECS/Fargate
+
+## 2. Prérequis
+
+- Dépôt Git (GitHub/GitLab/Bitbucket) contenant ce frontend.
+- Projet AWS avec accès Amplify + gestion DNS.
+- Backend déjà exposé publiquement via ALB (HTTPS).
+- Certificats TLS valides (gérés par Amplify pour frontend, ACM/ALB pour API).
+
+## 3. Variables d'environnement nécessaires (Amplify)
+
+Configurer dans Amplify Console -> App settings -> Environment variables:
+
+- `NEXT_PUBLIC_API_URL=https://co-64d04bd0e3a543c9a00182d31e71a818.ecs.eu-west-1.on.aws`
+  - Base URL de l'API REST appelée par le frontend.
+  - Utilisée dans le code: oui (massivement).
+
+- `NEXT_PUBLIC_WS_URL=https://co-64d04bd0e3a543c9a00182d31e71a818.ecs.eu-west-1.on.aws`
+  - Endpoint WebSocket pour le chat temps réel.
+  - Utilisée dans le code: oui.
+
+- `NEXTAUTH_URL=https://main.dk9lkc5yg76k.amplifyapp.com`
+  - URL publique du frontend pour NextAuth (callbacks/cookies/contexte d'hôte).
+  - Pas utilisée directement dans le code mais utilisée par NextAuth au runtime.
+
+- `NEXTAUTH_SECRET=<secret_fort>`
+  - Secret de signature/chiffrement des sessions JWT NextAuth.
+  - Pas utilisée directement dans le code mais utilisée par NextAuth au runtime.
+
+## 4. Étapes de déploiement (Git -> Amplify)
+
+1. Pousser le code sur la branche cible:
+   - `main`
+2. Dans Amplify:
+   - `New app` -> `Host web app`
+   - Connecter le provider Git
+   - Sélectionner repo + branche.
+3. Vérifier l'utilisation du fichier `amplify.yml` du repo.
+4. Ajouter les variables d'environnement listées ci-dessus.
+5. Lancer le premier déploiement.
+6Vérifier après déploiement:
+   - login NextAuth
+   - appels API vers le back end via load balancer.
+6. Configurer CORS côté backend pour autoriser l'origine frontend `https://main.dk9lkc5yg76k.amplifyapp.com/`.
+
+## 5. Pourquoi Amplify et pas S3 statique ?
+
+Amplify est le bon choix ici car ce frontend n'est pas un simple site statique:
+
+- Projet Next.js App Router avec logique serveur (ex: route NextAuth `/api/auth/[...nextauth]`).
+- Authentification NextAuth nécessite un runtime serveur pour gérer sessions/cookies/callbacks.
+- CI/CD Git intégré (build à chaque push), previews de branches, domaine/SSL simplifiés.
+- Support natif du déploiement Next.js moderne sans refactor majeur.
+
+S3 statique conviendrait seulement pour un site 100% exportable (`next export`) sans runtime serveur.
+Dans l'état actuel du code, passer en S3 statique demanderait une refonte de l'auth et des routes serveur.
