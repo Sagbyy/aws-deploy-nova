@@ -384,6 +384,7 @@ La lambda fournie (`S3Client({})`) utilise le role IAM et n'impose pas de variab
 - Bucket: `cloud-nova-images`
 - Block Public Access: ON
 - Aucune policy publique
+- Création d'un dossier "uploads/" et "resized/" dans le bucket S3
 - Notification d'evenement vers lambda:
   - Event: `s3:ObjectCreated:Put`
   - Prefix: `uploads/`
