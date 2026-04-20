@@ -5,6 +5,10 @@ Les projets sont disponible dans ces repos ci dessous :
 - [nova-core](https://github.com/Nova-Center/nova-core) (API)
 - [nova-connect](https://github.com/tavananh95/nova-connect) (Next.js frontend)
 
+URL de l'application déployée : 
+
+https://main.dk9lkc5yg76k.amplifyapp.com/
+
 ---
 
 # Partie 1 - Projet (architecture AWS)
